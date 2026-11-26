@@ -1,0 +1,56 @@
+name: package-portable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tarball_name:
+        description: "Output tarball filename"
+        required: false
+        default: "openset-llm-linux-x86_64.tar.gz"
+
+permissions:
+  contents: read
+
+jobs:
+  build-portable-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build git ca-certificates
+
+      - name: Build portable x86-64 engine (no model weights)
+        run: |
+          FORK_SHA=$(grep -m1 '^FORK_SHA=' install.sh | cut -d= -f2)
+          FORK_URL=$(grep -m1 '^FORK_URL=' install.sh | cut -d= -f2)
+          git clone -q "$FORK_URL" /tmp/llama.cpp
+          git -C /tmp/llama.cpp checkout -q "$FORK_SHA"
+          sh patches/apply.sh /tmp/llama.cpp
+          cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+          cmake --build /tmp/llama.cpp/build -j"$(nproc)"
+          mkdir -p "$HOME/.openset-llm/bin"
+          cp -a /tmp/llama.cpp/build/bin/llama-server /tmp/llama.cpp/build/bin/*.so* "$HOME/.openset-llm/bin/"
+
+      - name: Pack tarball and SHA256SUMS
+        run: |
+          OUT="${{ inputs.tarball_name }}"
+          bash scripts/package.sh "$OUT"
+          sha256sum "$OUT" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openset-llm-portable-linux-x86_64
+          path: |
+            ${{ inputs.tarball_name }}
+            SHA256SUMS
+          retention-days: 14
