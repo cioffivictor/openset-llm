@@ -307,7 +307,8 @@ trained on the full-precision model improves this ternary build on any task.
 ## Several requests at once (`--multi`)
 
 `./serve --multi N` serves N requests together: every pass over the ~6 GB of weights produces one token for each of
-them. Speculation and agent-loop resume are off in this mode (speculation with it is untested); `--ctx` is per stream.
+them. Speculation is off in this mode; `--ctx` is per stream. A system prompt (and tool list) that the streams share is
+read once, kept on disk, and loaded by every stream that needs it.
 
 | 8 vCPU / 8 GB, Ice Lake Xeon (2026-11-11) | one stream (`--no-spec`) | `--multi 4`, four short prompts together |
 |---|---|---|
@@ -319,6 +320,16 @@ them. Speculation and agent-loop resume are off in this mode (speculation with i
 - With ~800-token prompts the total falls to 7–10 tok/s: a newcomer's prompt is read on its own, and the other streams
   pause for those batches (that keeps outputs identical).
 - 8 streams leave < 0.3 GB free on an 8 GB machine, so `serve` warns above 6.
+- **Agents that share a system prompt** (measured 2026-11-25 on 8 vCPU / 8 GB Ice Lake boxes; every agent sends a
+  1.5k–3.9k-token prompt whose ending changes each step, 1.2k–1.8k tokens of it a shared system prompt + tools): the
+  server reads 32 % (4 streams) or 46 % (2 streams) of the prompt tokens instead of all of them, and a step of all
+  agents takes 58–71 s instead of 157–177 s with 4 streams (2.5–2.8×), 85 s instead of 168–170 s with 2 (2.0×).
+  It costs no memory, and the replies are byte-identical to `--no-resume` and to each request alone (every request
+  compared). The gain is the shared part: a stream still reads everything after the system prompt again.
+- The single-stream server's exact resume point (one checkpoint per stream, ~150 MiB each) is off with `--multi`; it
+  can be tried with `./serve --multi N -- --ctx-checkpoints 1` (experimental; 4 streams with it leave < 0.1 GB free on 8 GB).
+- Speculation inside `--multi` is not offered: a first look with 2 streams on 8 GB ran at 0.4–0.7× the speed of
+  `--multi 2` without it, with replies that no longer matched the request alone; with 4 streams it ran out of memory.
 - One user wanting the fastest single reply: plain `./serve`. Several users, agents or best-of-N
   sampling: `--multi`.
 
@@ -394,7 +405,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
   (summaries, rewrites, code edits) and less on short open questions; the numbers above are for the benchmark prompts.
 - **Resume keeps prompt states on disk.** To continue agent loops quickly, the server saves up to 8 prefix states
   (about 0.3 GB each, built from the start of your prompts) in `~/.openset-llm/state`. Delete that folder to clear
-  them, or run `./serve --no-resume`.
+  them, or run `./serve --no-resume`. `--multi` uses the same folder (its states are separate from single-stream ones).
 - **The model is PrismML's ternary Bonsai-2-27B**, with thinking off by default (`./serve --think`). The server
   repacks the weights every time it starts, before it accepts requests (20–45 s on the box we measured).
 

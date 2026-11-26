@@ -14,6 +14,9 @@
 #    q8_K as a KV cache type (int8 KV, opt-in). GGML_ATTN=0 selects the fork's paths.
 # 10. 0009-*.patch: kv5 / kv6 KV cache types (kernels/kvq.h: 5 / 6-bit rows read by attn-fast.inc; opt-in,
 #    `serve --kv6` / `--kv5`).
+# 11. 0010-*.patch: resume for `serve --multi`: LLAMA_RESUME_PREFIX_ONLY=1 with --ctx-checkpoints 0 uses the prefix states
+#    on disk without a checkpoint in RAM (unset = 0007's resume logic); and state files are sealed with a trailer, so a
+#    file cut short on disk is written again instead of aborting the server.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 src=${1:?usage: apply.sh <llama.cpp checkout>}

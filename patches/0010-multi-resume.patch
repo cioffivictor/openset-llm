@@ -1,0 +1,133 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3ac30a7..b81ed57 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -92,6 +92,12 @@ static bool rsm_on() {
+     }
+     return rsm.on == 1;
+ }
++// 0010: LLAMA_RESUME_PREFIX_ONLY=1 keeps part (c) alive with --ctx-checkpoints 0 (serve --multi): the prefix state on
++// disk is written once and loaded whenever a request's cache cannot be continued; no checkpoint is kept in RAM
++static bool rsm_prefix_only() {
++    static const bool v = [] { const char * e = getenv("LLAMA_RESUME_PREFIX_ONLY"); return e && atoi(e) != 0; }();
++    return v && rsm_on() && !rsm.dir.empty();
++}
+ // resume rate of a kind: observed (hits, tries) plus a prior worth 2 tries
+ static double rsm_rate(int k) {
+     static const double prior[RSM_N_KINDS] = { 0.2, 0.5, 0.3, 0.5, 0.9 };
+@@ -178,6 +184,31 @@ static void rsm_prune() {
+         for (const char * ext : { ".tgt", ".dft", ".spec" }) { p.replace_extension(ext); std::filesystem::remove(p, ec); }
+     }
+ }
++// 0010: a state file is sealed with a 16-byte trailer (magic + the length of what precedes it) once it is complete on
++// disk. The loader ignores bytes after the state. A file without a matching trailer (cut short: a full disk, a copy
++// that broke off) is never handed to the loader, which aborts the server on it.
++static const char RSM_SEAL[8] = { 'R', 'S', 'M', 'S', 'E', 'A', 'L', '1' };
++static bool rsm_seal(const std::string & path, uint64_t n) {
++    std::error_code ec;
++    if (n == 0 || std::filesystem::file_size(path, ec) != n || ec) { return false; }
++    std::ofstream f(path, std::ios::binary | std::ios::app);
++    f.write(RSM_SEAL, sizeof(RSM_SEAL));
++    f.write((const char *) &n, sizeof(n));
++    f.flush();
++    return (bool) f;
++}
++static bool rsm_sealed(const std::string & path) {
++    std::error_code ec;
++    const uint64_t sz = std::filesystem::file_size(path, ec);
++    if (ec || sz < 16) { return false; }
++    std::ifstream f(path, std::ios::binary);
++    f.seekg((std::streamoff) (sz - 16));
++    char m[sizeof(RSM_SEAL)];
++    uint64_t n = 0;
++    f.read(m, sizeof(m));
++    f.read((char *) &n, sizeof(n));
++    return f && std::equal(m, m + sizeof(m), RSM_SEAL) && n == sz - 16;
++}
+ static bool rsm_read_bytes(const std::string & path, std::vector<uint8_t> & out) {
+     std::ifstream f(path, std::ios::binary);
+     if (!f) { return false; }
+@@ -2669,7 +2700,8 @@ private:
+         slot.mem.seq_rm(slot.id, -1, -1);
+         llama_tokens got(p);
+         size_t n_got = 0;
+-        bool ok = llama_state_seq_load_file(ctx_tgt, ft.c_str(), slot.id, got.data(), got.size(), &n_got) > 0 && n_got == (size_t) p && got == pre;
++        bool ok = rsm_sealed(ft) && (!ctx_dft || rsm_sealed(rsm_path(h, "dft")));   // 0010: complete files only
++        ok = ok && llama_state_seq_load_file(ctx_tgt, ft.c_str(), slot.id, got.data(), got.size(), &n_got) > 0 && n_got == (size_t) p && got == pre;
+         if (ok && ctx_dft) {
+             size_t n_d = 0;
+             ok = llama_state_seq_load_file(ctx_dft, rsm_path(h, "dft").c_str(), slot.id, got.data(), got.size(), &n_d) > 0 && n_d == (size_t) p;
+@@ -2711,18 +2743,22 @@ private:
+         std::error_code ec;
+         const std::string ft = rsm_path(h, "tgt");
+         const std::string tmp_t = ft + ".tmp";
+-        bytes += llama_state_seq_save_file(ctx_tgt, tmp_t.c_str(), slot.id, pre.data(), pre.size());
++        const size_t n_t = llama_state_seq_save_file(ctx_tgt, tmp_t.c_str(), slot.id, pre.data(), pre.size());
++        bytes += n_t;
++        ok = rsm_seal(tmp_t, n_t);   // 0010
+         rsm_drop_cache(tmp_t);
+         if (ctx_dft) {
+             const std::string fd = rsm_path(h, "dft");
+-            bytes += llama_state_seq_save_file(ctx_dft, fd.c_str(), slot.id, pre.data(), pre.size());
++            const size_t n_d = llama_state_seq_save_file(ctx_dft, fd.c_str(), slot.id, pre.data(), pre.size());
++            bytes += n_d;
++            ok = rsm_seal(fd, n_d) && ok;
+             rsm_drop_cache(fd);
+         }
+         std::vector<uint8_t> sp;
+         if (common_speculative_get_state(spec.get(), slot.id, sp)) {
+             std::ofstream f(rsm_path(h, "spec"), std::ios::binary);
+             f.write((const char *) sp.data(), sp.size());
+-            ok = (bool) f;
++            ok = (bool) f && ok;
+             bytes += sp.size();
+         } else {
+             std::filesystem::remove(rsm_path(h, "spec"), ec);
+@@ -2730,6 +2766,8 @@ private:
+         if (ok) {
+             std::filesystem::rename(tmp_t, ft, ec);   // the .tgt file appears last: it marks a complete set
+             ok = !ec;
++        } else {
++            std::filesystem::remove(tmp_t, ec);
+         }
+         SLT_INF(slot, "resume: %s the %d-token prefix state (%.1f MiB) in %.2f s\n", ok ? "wrote" : "FAILED to write", p,
+                 bytes / 1024.0 / 1024.0, (ggml_time_us() - t0) / 1e6);
+@@ -3693,6 +3731,10 @@ private:
+ 
+                             if (rsm_on() && params_base.n_ctx_checkpoints > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                                 rsm_task_start(slot, n_past);
++                            } else if (rsm_prefix_only() && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
++                                slot.rsm_points.clear();
++                                slot.rsm_prefix = -1;
++                                rsm_load_prefix(slot, n_past);
+                             }
+ 
+                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+@@ -3793,7 +3835,7 @@ private:
+                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                         pos_next = 0;
+                                         n_past = 0;
+-                                        if (rsm_on() && params_base.n_ctx_checkpoints > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
++                                        if (rsm_on() && (params_base.n_ctx_checkpoints > 0 || rsm_prefix_only()) && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                                             int32_t np = 0;
+                                             if (rsm_load_prefix(slot, np)) {   // the cache is now exactly the prefix
+                                                 n_past   = np;
+@@ -3989,6 +4031,9 @@ private:
+                         if (do_checkpoint && rsm_on() && (slot.rsm_is_point(slot.prompt.n_tokens()) || slot.prompt.n_tokens() == slot.rsm_prefix)) {
+                             break;
+                         }
++                        if (!do_checkpoint && rsm_prefix_only() && slot.prompt.n_tokens() == slot.rsm_prefix) {
++                            break;
++                        }
+ 
+                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
+                         // create checkpoints that many tokens before the end of the prompt:
+@@ -4022,7 +4067,7 @@ private:
+                     const bool is_user_start = spans.is_user_start(n_tokens_start);
+                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                     const bool rsm_point = do_checkpoint && rsm_on() && slot.rsm_is_point(n_tokens_start);
+-                    if (do_checkpoint && rsm_on() && n_tokens_start == slot.rsm_prefix && !has_mtmd) {
++                    if ((do_checkpoint ? rsm_on() : rsm_prefix_only()) && n_tokens_start == slot.rsm_prefix && !has_mtmd) {
+                         rsm_save_prefix(slot);
+                     }
+ 

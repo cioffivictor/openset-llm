@@ -5,6 +5,12 @@ All notable changes to openset-llm. Dates are YYYY-MM-DD.
 ## Unreleased
 
 - `bench/quick.sh`: a 3-minute speed check that prints a block to paste into a "Measurement on my machine" issue.
+- `docker-compose.yml`: `docker compose up` builds the image, keeps the model in a named volume and waits on `/health`.
+- `./serve --multi N`: a system prompt the streams share is read once and loaded from disk afterwards (the prefix part
+  of agent-loop resume; it was off with `--multi`). Same replies as `--no-resume`, no extra memory. `--multi` now
+  writes prefix states to `~/.openset-llm/state` like the single-stream server does.
+- A prefix state file that was cut short on disk (for example by a full disk) made the server abort when a request
+  tried to load it. Such a file is now detected, removed and written again.
 
 ## 0.1.0 (2026-11-25)
 

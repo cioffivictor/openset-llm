@@ -3,7 +3,8 @@
 #
 #   ./serve                       # 127.0.0.1:8080, 4k context, speculative decoding on, thinking off
 #   ./serve --host 0.0.0.0 --port 8080 --ctx 8192 --threads 8   # 8k on 8 GB: plain decoding, ~1 GB to spare
-#   ./serve --multi 4             # 4 requests decode together: ~2.3x the total tok/s; no speculation, no resume, 2k ctx each
+#   ./serve --multi 4             # 4 requests decode together: ~2.3x the total tok/s; no speculation, 2k ctx each;
+#                                 #   a system prompt the streams share is read once and then loaded from disk
 #   ./serve --no-webui            # API only: do not serve the chat page at /
 #   ./serve --no-spec             # plain decoding (no speculation)
 #   ./serve --spec                # keep speculation on where serve would turn it off: for lack of memory
@@ -56,16 +57,23 @@ case $MULTI in ''|*[!0-9]*) echo "--multi takes a number of streams (2-8)" >&2; 
 for v in "$PORT" "$THREADS" ${CTX:+"$CTX"} ${DEPTH:+"$DEPTH"}; do
   case $v in ''|*[!0-9]*) echo "--port, --ctx, --threads and --spec-depth take a number (got: $v)" >&2; exit 2 ;; esac
 done
-CKPT=1
+CKPT=1; RESUME_MODE=full
 if [ "$MULTI" -ge 2 ]; then
   # X2: N streams share each pass over the weights. --ctx is per stream here. Speculation is off (X1/MTP + X2 is untested).
   [ "$MULTI" -gt 8 ] && { echo "--multi: at most 8 streams" >&2; exit 2; }
   [ "$MULTI" -gt 6 ] && echo "warning: --multi $MULTI > 6: measured 8 streams leave < 0.3 GB free on an 8 GB machine" >&2
   [ "$SPEC" = 1 ] && echo "note: --multi turns speculation off (the two together are untested)" >&2
-  [ "$RESUME" = 1 ] && echo "note: --multi turns agent-loop resume off" >&2
   SPEC=0
   [ -z "$CTX" ] && { [ "$MULTI" -le 4 ] && CTX=2048 || CTX=1024; }
   NP=$MULTI; CTX_TOTAL=$((CTX * MULTI)); CKPT=0
+  # Resume with several streams (0010; measured 2026-11-25 on 8 vCPU / 8 GB boxes with 2, 4 and 6 streams): the state at
+  # the end of the system(+tools) prompt is written to disk once and loaded by every stream that cannot continue what it
+  # holds (a new conversation, a rewritten ending, a restart). No checkpoint in RAM, the prompt is read in the same
+  # batches as without it, and every generated token's logprobs came out equal to --no-resume.
+  # The per-stream checkpoint of the single-stream server (the exact resume point after a rewritten ending) stays off
+  # here: ~150 MiB of RAM per stream (4 x 2048 on 8 GB: 0.08 GB left) and logprobs not always bit-equal to --no-resume.
+  # It can be tried with:  ./serve --multi N -- --ctx-checkpoints 1
+  [ "$RESUME" = 1 ] && RESUME_MODE=prefix
   export GGML_X2=${GGML_X2:-95} LLAMA_X2_SERIAL_PREFILL=${LLAMA_X2_SERIAL_PREFILL:-1} LLAMA_X2_CKPT_SPLIT=${LLAMA_X2_CKPT_SPLIT:-1}
   if [ "$CTX_TOTAL" -gt 8192 ]; then
     echo "warning: $MULTI streams x $CTX tokens = $CTX_TOTAL > 8192 total; measured safe on 8 GB: 4 x 2048, 6 x 1024" >&2
@@ -94,6 +102,7 @@ fi
 if [ "$RESUME" = 1 ]; then
   # 0007: one checkpoint in RAM (as before), placed where the next request will resume; prefix states on disk (~0.3 GB each)
   export LLAMA_RESUME=${LLAMA_RESUME:-1} LLAMA_RESUME_DIR=${LLAMA_RESUME_DIR-$PREFIX/state}
+  [ "$RESUME_MODE" = prefix ] && export LLAMA_RESUME_PREFIX_ONLY=${LLAMA_RESUME_PREFIX_ONLY:-1}
 else
   export LLAMA_RESUME=0 LLAMA_RESUME_DIR=
 fi
@@ -174,5 +183,5 @@ fi
 export LD_LIBRARY_PATH="$BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 SHOW=$HOST; [ "$HOST" = 0.0.0.0 ] && SHOW=127.0.0.1
 [ "$WEBUI" = 1 ] && echo "chat: open http://$SHOW:$PORT in a browser (the page answers once the model has loaded)" >&2
-echo "serving on http://$HOST:$PORT/v1 (speculation: $SPECNAME, streams: $NP, ctx: $CTX_TOTAL, thinking: $THINK, resume: $([ "$RESUME" = 1 ] && [ "$CKPT" -gt 0 ] && echo on || echo off))" >&2
+echo "serving on http://$HOST:$PORT/v1 (speculation: $SPECNAME, streams: $NP, ctx: $CTX_TOTAL, thinking: $THINK, resume: $([ "$RESUME" = 0 ] && echo off || { [ "$RESUME_MODE" = prefix ] && echo "on (shared prefix)" || echo on; }))" >&2
 exec "$BIN/llama-server" "${args[@]}" "${EXTRA[@]}"
